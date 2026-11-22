@@ -19,7 +19,7 @@ type Server struct {
 	cfg      *config.Config
 	accounts *accounts.Manager
 	tokens   *APIKeyAuth
-	upstream *Upstream
+	chat     func(context.Context, *Session, ChatInput, EventFunc) (ChatResult, error)
 	sessions *conversationStore
 }
 
@@ -28,7 +28,7 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		cfg:      cfg,
 		accounts: mgr,
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
-		upstream: NewUpstream(cfg),
+		chat:     NewUpstream(cfg).Chat,
 		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256),
 	}
 }
@@ -109,8 +109,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	model := s.mapModel(req.Model)
 	allowedTools := requestedToolNames(&req)
 	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
-	if choiceMode == "function" && choiceName != "" {
-		allowedTools[choiceName] = true
+	if choiceMode == "function" && !allowedTools[choiceName] {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_choice names an undeclared tool")
+		return
 	}
 	parallelTools := true
 	if req.ParallelToolCalls != nil {
@@ -193,6 +194,43 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return s.accounts.Next(ctx)
 	}
 
+	finishTools := func(res *ChatResult) (string, []ToolCall, error) {
+		allowed := allowedTools
+		if choiceMode == "function" {
+			allowed = map[string]bool{choiceName: true}
+		}
+		text, calls, err := resolveToolCalls(*res, allowed, choiceMode, choiceName, parallelTools)
+		if !errors.Is(err, errToolMarker) || ctx.Err() != nil {
+			return text, calls, err
+		}
+		conv.reset()
+		repair := ChatInput{
+			Model:         in.Model,
+			ChatAgentID:   in.ChatAgentID,
+			CreateSession: true,
+			DeleteSession: true,
+			SystemPrompt:  in.SystemPrompt + "\nReformat the rejected draft. Preserve argument values. Do not execute the task.",
+			Title:         "Format client tool call",
+			Prompt:        rawArgumentRepair + "\nRejected draft:\n" + res.Text,
+		}
+		fixed, err := s.chat(ctx, SessionFromAccount(usedAccount, s.cfg), repair, nil)
+		if err != nil {
+			return "", nil, err
+		}
+		res.Usage.add(fixed.Usage)
+		text, calls, err = repairedToolCalls(fixed, allowed, choiceMode, choiceName, parallelTools)
+		if err == nil && len(calls) == 0 {
+			err = errToolMarker
+		}
+		return text, calls, err
+	}
+	writeToolError := func(err error) {
+		code := "upstream_error"
+		if errors.Is(err, errToolMarker) {
+			code = "invalid_tool_call"
+		}
+		writeOpenAIError(w, http.StatusBadGateway, code, err.Error())
+	}
 	if !req.Stream {
 		var res ChatResult
 		var lastErr error
@@ -214,7 +252,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-			res, err = s.upstream.Chat(ctx, sess, in, nil)
+			res, err = s.chat(ctx, sess, in, nil)
 			if err == nil {
 				lastErr = nil
 				break
@@ -262,15 +300,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			conv.systemPrompt = systemPromptText
 		}
 		text := res.Text
-		var replies []ToolCallReply
+		var toolCalls []ToolCall
 		if bridgeActive {
-			text, replies = parseClientToolCalls(text, allowedTools)
-			if len(replies) == 0 {
-				replies = nativeToolReplies(res.ToolCalls, allowedTools)
+			text, toolCalls, err = finishTools(&res)
+			if err != nil {
+				writeToolError(err)
+				return
 			}
-			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
 		}
-		toolCalls := replyToolCalls(replies)
 		if !hasVisibleText(text) && len(toolCalls) == 0 {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
@@ -368,7 +405,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sawVisibleText := false
-	var bridgeBuffer strings.Builder
 
 	var res ChatResult
 	var lastErr error
@@ -390,12 +426,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
-			if ev.Type == "text" && ev.Text != "" {
-				if bridgeActive {
-					bridgeBuffer.WriteString(ev.Text)
-					return nil
-				}
+		res, err = s.chat(ctx, sess, in, func(ev StreamEvent) error {
+			if !bridgeActive && ev.Type == "text" && ev.Text != "" {
 				if hasVisibleText(ev.Text) {
 					sawVisibleText = true
 				}
@@ -423,7 +455,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			in.CreateSession = true
 			in.Prompt = prompt
 			sawVisibleText = false
-			bridgeBuffer.Reset()
 			log.Printf("chat %s session resume failed; retrying with full transcript", id)
 			continue
 		}
@@ -436,7 +467,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Nothing reached the client yet; reset per-attempt state and try
 		// the next account in rotation.
 		sawVisibleText = false
-		bridgeBuffer.Reset()
 	}
 	if lastErr != nil {
 		conv.reset()
@@ -468,15 +498,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var outTools []ToolCall
 	finish := "stop"
 	if bridgeActive {
-		// Assign to the outer variables: a `:=` here would shadow outText and
-		// drop the buffered answer, streaming a stop with usage but no content.
-		var replies []ToolCallReply
-		outText, replies = parseClientToolCalls(bridgeBuffer.String(), allowedTools)
-		if len(replies) == 0 {
-			replies = nativeToolReplies(res.ToolCalls, allowedTools)
+		outText, outTools, err = finishTools(&res)
+		if err != nil {
+			writeToolError(err)
+			return
 		}
-		replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
-		outTools = replyToolCalls(replies)
 		if len(outTools) > 0 {
 			finish = "tool_calls"
 		} else if !hasVisibleText(outText) {

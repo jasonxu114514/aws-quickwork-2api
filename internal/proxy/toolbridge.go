@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -297,10 +298,17 @@ func repliesFromEnvelopes(envelopes []toolCallEnvelope, allowed map[string]bool)
 		if name == "" {
 			continue
 		}
+		argumentText := rawArgumentText(args)
+		if argumentText == "" || argumentText == "null" {
+			argumentText = "{}"
+		}
+		if !strings.HasPrefix(argumentText, "{") || !json.Valid([]byte(argumentText)) {
+			continue
+		}
 		out = append(out, ToolCallReply{
 			ID:        "call_" + strings.ReplaceAll(uuid(), "-", ""),
 			Name:      name,
-			Arguments: normalizeArguments(args),
+			Arguments: argumentText,
 		})
 	}
 	return out
@@ -320,43 +328,90 @@ func findToolTag(text string) (start int, open, close string) {
 	return start, open, close
 }
 
-// extractTaggedToolCalls removes valid tool markers and returns the remaining
-// text. Invalid or unknown markers are left untouched so ordinary text is
-// never lost.
-func extractTaggedToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
-	var clean strings.Builder
-	var replies []ToolCallReply
-	rest := text
-	changed := false
-	for {
-		start, open, close := findToolTag(rest)
-		if start < 0 || open == "" {
-			clean.WriteString(rest)
-			break
-		}
-		bodyStart := start + len(open)
-		relEnd := strings.Index(rest[bodyStart:], close)
-		if relEnd < 0 {
-			clean.WriteString(rest)
-			break
-		}
-		bodyEnd := bodyStart + relEnd
-		parsed := repliesFromEnvelopes(parseToolEnvelopes(rest[bodyStart:bodyEnd]), allowed)
-		if len(parsed) == 0 {
-			clearEnd := bodyEnd + len(close)
-			clean.WriteString(rest[:clearEnd])
-			rest = rest[clearEnd:]
+// Model-written commands sometimes contain literal line breaks or regex
+// escapes such as \s. Quote only bytes that JSON cannot already decode.
+func quoteInvalidStringEscapes(payload string) string {
+	var out strings.Builder
+	inString := false
+	for i := 0; i < len(payload); i++ {
+		c := payload[i]
+		switch {
+		case c == '"':
+			inString = !inString
+		case inString && c == '\\' && i+1 < len(payload):
+			next := payload[i+1]
+			out.WriteByte('\\')
+			if strings.ContainsRune(`"\/bfnrtu`, rune(next)) {
+				i++
+				out.WriteByte(next)
+				continue
+			}
+		case inString && c < 0x20:
+			fmt.Fprintf(&out, `\u%04x`, c)
 			continue
 		}
-		clean.WriteString(rest[:start])
-		replies = append(replies, parsed...)
-		rest = rest[bodyEnd+len(close):]
-		changed = true
+		out.WriteByte(c)
 	}
-	if !changed {
-		return text, nil
+	return out.String()
+}
+
+var errToolMarker = errors.New("upstream returned an incomplete or invalid client tool call")
+
+// Read one complete JSON value before looking for its closing marker. A
+// command can itself contain the literal marker, for example in a file edit.
+func markedToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply, error) {
+	var clean strings.Builder
+	var replies []ToolCallReply
+	for {
+		start, open, close := findToolTag(text)
+		if start < 0 {
+			clean.WriteString(text)
+			break
+		}
+		clean.WriteString(text[:start])
+		rest := text[start+len(open):]
+		var found bool
+		trimmed := strings.TrimLeft(rest, " \t\r\n")
+		if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+			clean.WriteString(open)
+			text = rest
+			continue
+		}
+		rest = trimmed
+		dec := json.NewDecoder(strings.NewReader(rest))
+		var raw json.RawMessage
+		var payload, after string
+		if err := dec.Decode(&raw); err == nil {
+			payload = string(raw)
+			tail := strings.TrimLeft(rest[dec.InputOffset():], " \t\r\n")
+			if tail == "" {
+				// The JSON value is complete and only its final tag is missing.
+				after, found = "", true
+			} else {
+				after, found = strings.CutPrefix(tail, close)
+			}
+		} else {
+			payload, after, found = strings.Cut(rest, close)
+			payload = quoteInvalidStringEscapes(payload)
+		}
+		if !found {
+			return "", nil, fmt.Errorf("%w: missing closing marker", errToolMarker)
+		}
+		envelopes := parseToolEnvelopes(payload)
+		if len(envelopes) == 0 {
+			return "", nil, fmt.Errorf("%w: could not decode call JSON", errToolMarker)
+		}
+		calls := repliesFromEnvelopes(envelopes, allowed)
+		if len(calls) == 0 || len(calls) != len(envelopes) {
+			return "", nil, fmt.Errorf("%w: tool name or arguments do not match the client protocol", errToolMarker)
+		}
+		replies = append(replies, calls...)
+		text = after
 	}
-	return strings.TrimSpace(clean.String()), replies
+	if len(replies) == 0 {
+		return clean.String(), nil, nil
+	}
+	return strings.TrimSpace(clean.String()), replies, nil
 }
 
 // dropEmptyFences removes a Markdown fence that only wrapped a tool marker.
@@ -435,18 +490,6 @@ func extractBareToolCall(text string, allowed map[string]bool) (string, []ToolCa
 		return text, nil
 	}
 	return "", replies
-}
-
-func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
-	clean, replies := extractTaggedToolCalls(text, allowed)
-	if len(replies) > 0 {
-		return dropEmptyFences(clean), replies
-	}
-	clean, replies = extractFencedToolCalls(text, allowed)
-	if len(replies) > 0 {
-		return clean, replies
-	}
-	return extractBareToolCall(text, allowed)
 }
 
 // limitToolReplies enforces tool_choice/parallel_tool_calls limits.
@@ -534,4 +577,59 @@ func parseToolChoice(v any) (mode, name string) {
 		}
 	}
 	return "auto", ""
+}
+func resolveToolCalls(res ChatResult, allowed map[string]bool, mode, name string, parallel bool) (string, []ToolCall, error) {
+	if mode == "none" || len(allowed) == 0 {
+		return res.Text, nil, nil
+	}
+	text, replies, err := markedToolCalls(res.Text, allowed)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(replies) == 0 {
+		text, replies = extractFencedToolCalls(text, allowed)
+	}
+	if len(replies) == 0 {
+		text, replies = extractBareToolCall(text, allowed)
+	}
+	if len(replies) == 0 {
+		replies = nativeToolReplies(res.ToolCalls, allowed)
+	}
+	if len(replies) > 0 {
+		text = dropEmptyFences(text)
+	}
+	return text, replyToolCalls(limitToolReplies(replies, mode, name, parallel)), nil
+}
+
+// A format-repair response can put one long string argument after a JSON
+// header. Commands and file contents then need no additional escaping.
+const rawArgumentRepair = `For a single call containing a command or file contents, use this exact alternative:
+CLIENT_TOOL_TEXT
+{"name":"actual tool name","text_argument":"actual string parameter name","arguments":{"other_parameter":"other value"}}
+literal text parameter value, with original quotes and line breaks
+END_CLIENT_TOOL_TEXT
+The header occupies one line. Put all remaining parameters in arguments. Output nothing else. For multiple calls, use the normal protocol.`
+
+func repairedToolCalls(res ChatResult, allowed map[string]bool, mode, name string, parallel bool) (string, []ToolCall, error) {
+	body, raw := strings.CutPrefix(strings.TrimSpace(res.Text), "CLIENT_TOOL_TEXT\n")
+	if !raw {
+		return resolveToolCalls(res, allowed, mode, name, parallel)
+	}
+	header, body, ok := strings.Cut(body, "\n")
+	value, closed := strings.CutSuffix(body, "\nEND_CLIENT_TOOL_TEXT")
+	var call struct {
+		Name  string                     `json:"name"`
+		Field string                     `json:"text_argument"`
+		Args  map[string]json.RawMessage `json:"arguments"`
+	}
+	if !ok || !closed || json.Unmarshal([]byte(header), &call) != nil || !allowed[call.Name] || call.Field == "" || call.Args == nil || call.Args[call.Field] != nil {
+		return "", nil, errToolMarker
+	}
+	call.Args[call.Field], _ = json.Marshal(value)
+	args, err := json.Marshal(call.Args)
+	if err != nil {
+		return "", nil, err
+	}
+	replies := repliesFromEnvelopes([]toolCallEnvelope{{Name: call.Name, Arguments: args}}, allowed)
+	return "", replyToolCalls(replies), nil
 }
