@@ -132,10 +132,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resume := false
 	promptText := prompt
+	promptMessages := req.Messages
 	if s.cfg.SessionReuse && conv.systemPrompt == systemPromptText {
 		if delta, ok := conv.delta(req.Messages); ok {
 			if deltaPrompt, err := formatPrompt(delta); err == nil && hasVisibleText(deltaPrompt) {
 				promptText = deltaPrompt
+				promptMessages = delta
 				resume = true
 			}
 		}
@@ -149,6 +151,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 	in := ChatInput{
 		Prompt:        promptText,
+		Messages:      promptMessages,
 		Model:         model,
 		ThreadID:      threadID,
 		Title:         titleFor(lastUserText(req.Messages)),
@@ -189,6 +192,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			in.ThreadID = ""
 			in.CreateSession = true
 			in.Prompt = prompt
+			in.Messages = req.Messages
 		}
 		return s.accounts.Next(ctx)
 	}
@@ -234,6 +238,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				in.ThreadID = ""
 				in.CreateSession = true
 				in.Prompt = prompt
+				in.Messages = req.Messages
 				log.Printf("chat %s session resume failed; retrying with full transcript", id)
 				continue
 			}
@@ -249,7 +254,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, accounts.ErrNoAccounts):
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
-				status, code = http.StatusBadRequest, "request_too_large"
+				status, code = http.StatusRequestEntityTooLarge, "context_length_exceeded"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
@@ -422,6 +427,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			in.ThreadID = ""
 			in.CreateSession = true
 			in.Prompt = prompt
+			in.Messages = req.Messages
 			sawVisibleText = false
 			bridgeBuffer.Reset()
 			log.Printf("chat %s session resume failed; retrying with full transcript", id)
@@ -446,7 +452,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, accounts.ErrNoAccounts):
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
-				status, code = http.StatusBadRequest, "request_too_large"
+				status, code = http.StatusRequestEntityTooLarge, "context_length_exceeded"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
