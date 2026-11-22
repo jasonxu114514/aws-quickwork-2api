@@ -35,7 +35,56 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
-	return s.withCORS(mux)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	return s.withLogging(s.withCORS(s.normalizePath(mux)))
+}
+
+// normalizePath 相容常見的路徑變體（例如重複的 /v1/v1/、缺少 /v1 前綴或結尾多餘斜線）。
+func (s *Server) normalizePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if len(p) > 1 && strings.HasSuffix(p, "/") {
+			p = strings.TrimRight(p, "/")
+		}
+		for strings.HasPrefix(p, "/v1/v1/") {
+			p = strings.TrimPrefix(p, "/v1")
+		}
+		switch p {
+		case "/models", "/chat/completions", "/responses":
+			p = "/v1" + p
+		}
+		if p != r.URL.Path {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = p
+			r = r2
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *Server) withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+	})
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -139,31 +188,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !req.Stream {
-		var res ChatResult
-		var lastErr error
-		for range s.maxAttempts(ctx) {
-			acct, err := s.accounts.Next(ctx)
-			if err != nil {
-				lastErr = err
-				break
-			}
-			sess := SessionFromAccount(acct, s.cfg)
-			if err := sess.validate(); err != nil {
-				s.accounts.ReportFailure(ctx, acct.ID, err)
-				lastErr = err
-				continue
-			}
-			res, err = s.upstream.Chat(ctx, sess, in, nil)
-			if err == nil {
-				lastErr = nil
-				break
-			}
-			lastErr = err
-			s.accounts.ReportFailure(ctx, acct.ID, err)
-			if ctx.Err() != nil {
-				break
-			}
-		}
+		res, lastErr := s.execNonStream(ctx, in)
 		if lastErr != nil {
 			status, code := http.StatusBadGateway, "upstream_error"
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
@@ -471,6 +496,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// execNonStream 依帳號輪詢與重試上限執行單次非串流上游請求。
+func (s *Server) execNonStream(ctx context.Context, in ChatInput) (ChatResult, error) {
+	var res ChatResult
+	var lastErr error
+	for range s.maxAttempts(ctx) {
+		acct, err := s.accounts.Next(ctx)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		sess := SessionFromAccount(acct, s.cfg)
+		if err := sess.validate(); err != nil {
+			s.accounts.ReportFailure(ctx, acct.ID, err)
+			lastErr = err
+			continue
+		}
+		res, err = s.upstream.Chat(ctx, sess, in, nil)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		s.accounts.ReportFailure(ctx, acct.ID, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return res, lastErr
 }
 
 func (s *Server) maxAttempts(ctx context.Context) int {

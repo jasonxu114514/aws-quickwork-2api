@@ -9,6 +9,7 @@
 ## 功能
 
 - `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
+- `POST /v1/responses`，相容 OpenAI Responses API（支援串流 SSE 與非串流回應、工具呼叫橋接與多輪 `function_call_output` 上下文）
 - `GET /v1/models`，返回本地模型别名
 - 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
 - 支持服务器/远程登录：手动粘贴浏览器 callback URL，无需开放本地回调端口
